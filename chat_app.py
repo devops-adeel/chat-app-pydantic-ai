@@ -58,6 +58,10 @@ SERVICE_ENDPOINT = os.environ.get(
 # Single-user personal assistant: one stable id scopes the user's memory graph
 # (Restate Virtual Object key + Graphiti group_id).
 MEMORY_USER_ID = os.environ.get("MEMORY_USER_ID", "default")
+# The user's display NAME — used as the episode speaker so Graphiti models them as a
+# Person entity. Must be a real name; the generic "User" does not mint a node, so
+# first-person self-state ("I feel…") would form no edges. Set MEMORY_USER_NAME in .env.
+MEMORY_USER_NAME = os.environ.get("MEMORY_USER_NAME", "User")
 
 THIS_DIR = Path(__file__).parent
 
@@ -172,6 +176,7 @@ async def _call_restate(prompt: str, messages: list[ModelMessage]) -> tuple[dict
     payload = {
         "prompt": prompt,
         "user_id": MEMORY_USER_ID,
+        "user_name": MEMORY_USER_NAME,
         "message_history": ModelMessagesTypeAdapter.dump_python(messages, mode="json"),
         "otel_context": otel_carrier,
     }

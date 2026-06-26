@@ -155,6 +155,9 @@ async def run(ctx: Context, payload: dict) -> dict:
     """
     prompt: str = payload["prompt"]
     user_id: str = payload.get("user_id", "default")
+    # The user's display NAME (not the id). Graphiti needs a named speaker to mint a
+    # Person node, otherwise first-person self-state ("I feel…") forms no edges.
+    user_name: str = payload.get("user_name", "User")
     history_json: list = payload.get("message_history", [])
     message_history = (
         ModelMessagesTypeAdapter.validate_python(history_json) if history_json else []
@@ -211,7 +214,9 @@ async def run(ctx: Context, payload: dict) -> dict:
             ingest,
             key=user_id,
             arg={
-                "episode_body": f"User: {prompt}\nAssistant: {result.output}",
+                # Frame the turn with the user's NAME as the speaker so Graphiti
+                # extracts them as a Person entity and self-state becomes edges.
+                "episode_body": f"{user_name}: {prompt}\nAssistant: {result.output}",
                 "reference_time": datetime.now(tz=UTC).isoformat(),
             },
         )
