@@ -5,3 +5,13 @@ __pycache__/
 .env
 .chat_app_messages.sqlite
 .python-version
+
+# Stray virtualenvs (the uv-managed env lives in .venv/)
+/chat_app/
+/chat-app-pydantic-ai/
+
+# Local Claude Code overrides (personal permissions, machine-specific)
+.claude/settings.local.json
+
+# Scratch / accidental output
+/pbcopy
