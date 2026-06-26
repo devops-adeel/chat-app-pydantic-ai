@@ -1,0 +1,25 @@
+services:
+  restate:
+    image: restatedev/restate:latest
+    ports:
+      - "8080:8080" # HTTP ingress — FastAPI POSTs handler invocations here
+      - "9070:9070" # Admin API — service registration and Restate UI
+      - "9071:9071" # Metrics (Prometheus)
+    volumes:
+      - restate-data:/restate-data
+
+  # Temporal memory graph. Neo4j >= 5.26 is Graphiti's stated minimum (vector index).
+  # Set NEO4J_PASSWORD in your .env (compose substitutes it here and the app reads it).
+  neo4j:
+    image: neo4j:5.26-community
+    ports:
+      - "7474:7474" # Neo4j browser — inspect the graph at http://localhost:7474
+      - "7687:7687" # Bolt — the app connects here
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-please_change_me}
+    volumes:
+      - neo4j-data:/data
+
+volumes:
+  restate-data:
+  neo4j-data:
