@@ -1,6 +1,6 @@
 services:
   restate:
-    image: restatedev/restate:latest
+    image: restatedev/restate:1.7.0
     ports:
       - "8080:8080" # HTTP ingress — FastAPI POSTs handler invocations here
       - "9070:9070" # Admin API — service registration and Restate UI
