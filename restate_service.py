@@ -203,6 +203,10 @@ async def run(ctx: Context, payload: dict) -> dict:
         )
         span.set_attribute("output.length", len(str(result.output)))
 
+    # Durable clock: a wall-clock value passed into a Context operation (the send
+    # below) would differ on replay and trip Restate's journal-mismatch check.
+    now = datetime.fromtimestamp(await ctx.time(), tz=UTC)
+
     # Fire-and-forget durable ingestion of this turn, ORDERED per user.
     # object_send to a Virtual Object queues serially per key, which is what
     # Graphiti's sequential contradiction detection requires. It is journaled,
@@ -217,7 +221,7 @@ async def run(ctx: Context, payload: dict) -> dict:
                 # Frame the turn with the user's NAME as the speaker so Graphiti
                 # extracts them as a Person entity and self-state becomes edges.
                 "episode_body": f"{user_name}: {prompt}\nAssistant: {result.output}",
-                "reference_time": datetime.now(tz=UTC).isoformat(),
+                "reference_time": now.isoformat(),
             },
         )
 
@@ -226,7 +230,7 @@ async def run(ctx: Context, payload: dict) -> dict:
         "new_messages": ModelMessagesTypeAdapter.dump_python(
             result.new_messages(), mode="json"
         ),
-        "timestamp": datetime.now(tz=UTC).isoformat(),
+        "timestamp": now.isoformat(),
     }
 
 
@@ -248,20 +252,26 @@ async def ingest(ctx: ObjectContext, payload: dict) -> dict:
     last_episode_uuid = await ctx.get("last_episode_uuid", type_hint=str)
     episode_body: str = payload["episode_body"]
     reference_time = datetime.fromisoformat(payload["reference_time"])
+    # Seeded by the invocation id, so a retry of the step below reuses the same
+    # episode node. The journal records a step's result only once it completes; a
+    # crash after Neo4j writes but before that record re-runs the step.
+    episode_uuid = str(ctx.uuid())
 
     async def _do() -> dict:
         graphiti = await get_graphiti()
-        episode_uuid, reflections = await memory.ingest_turn(
+        _, reflections = await memory.ingest_turn(
             graphiti,
             user_id=ctx.key(),
+            episode_uuid=episode_uuid,
             episode_body=episode_body,
             reference_time=reference_time,
             previous_episode_uuid=last_episode_uuid,
         )
         return {"episode_uuid": episode_uuid, "reflections": reflections}
 
-    # Journal the extraction result once; on replay it is NOT re-run (no duplicate
-    # LLM calls / writes), it is replayed from the journal.
+    # Journal the extraction result once: after it completes, replays read it from
+    # the journal instead of re-running it (no duplicate LLM calls). An attempt
+    # interrupted before completing IS re-run, hence the stable episode_uuid above.
     result = await ctx.run_typed("ingest_episode", _do)
 
     ctx.set("last_episode_uuid", result["episode_uuid"])
