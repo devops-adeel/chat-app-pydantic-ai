@@ -50,7 +50,7 @@ NOT start Docker or any service — start those yourself each session:
 - **Real chat needs real API keys**: `ANTHROPIC_API_KEY` (LLM), `TAVILY_API_KEY` (web search),
   `OPENAI_API_KEY` (Graphiti embeddings/reranking). With placeholder keys the whole pipeline
   runs but the model call returns `401 invalid x-api-key`; Restate then retries the invocation
-  indefinitely — cancel a stuck one with
+  (1.7.0 default: 70 attempts, backoff capped at 60s, then it pauses) — cancel a stuck one with
   `sudo docker exec workspace-restate-1 restate --yes invocations cancel --kill <inv_id>`.
 - Neo4j `EquivalentSchemaRuleAlreadyExists` warnings on backend startup are benign (Graphiti's
   idempotent index creation), not failures.

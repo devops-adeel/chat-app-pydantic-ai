@@ -1,6 +1,9 @@
 services:
   restate:
     image: restatedev/restate:1.7.0
+    # Restate names its node after the hostname; compose would give each new
+    # container a random one, and Restate then refuses the existing data volume.
+    hostname: restate
     ports:
       - "8080:8080" # HTTP ingress — FastAPI POSTs handler invocations here
       - "9070:9070" # Admin API — service registration and Restate UI
