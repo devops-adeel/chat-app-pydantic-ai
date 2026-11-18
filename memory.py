@@ -31,16 +31,21 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 
 from graphiti_core import Graphiti
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.edges import EntityEdge
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
+from graphiti_core.errors import NodeNotFoundError
 from graphiti_core.llm_client.anthropic_client import AnthropicClient
 from graphiti_core.llm_client.config import LLMConfig
-from graphiti_core.nodes import EpisodeType
-from graphiti_core.search.search_filters import SearchFilters
+from graphiti_core.nodes import EpisodeType, EpisodicNode
+from graphiti_core.search.search_filters import (
+    ComparisonOperator,
+    DateFilter,
+    SearchFilters,
+)
 from pydantic import BaseModel, Field
 
 # Quiet Neo4j's "property key does not exist" notifications. Graphiti's queries
@@ -272,6 +277,7 @@ async def ingest_turn(
     graphiti: Graphiti,
     *,
     user_id: str,
+    episode_uuid: str,
     episode_body: str,
     reference_time: datetime,
     previous_episode_uuid: str | None = None,
@@ -282,9 +288,23 @@ async def ingest_turn(
     Virtual Object keyed by user_id) — `add_episode` performs edge invalidation that
     depends on prior graph state.
 
+    Idempotent per `episode_uuid`: a retry after a crash mid-ingest reuses the same
+    episode node instead of minting a duplicate (Graphiti never dedupes episodes).
+    Entities/facts are re-extracted on retry and converge via Graphiti's own dedup —
+    best-effort, not exactly-once. Two residues of an interrupted attempt remain: a
+    fact it invalidated is not re-reported (that reflection can be lost), and its
+    episode→entity MENTIONS links are re-created (Graphiti mints them fresh uuids).
+
     Returns (episode_uuid, reflection_notes) where reflection_notes describe facts
     this turn invalidated — the proactive-nudge surface.
     """
+    await _ensure_episode(
+        graphiti,
+        episode_uuid=episode_uuid,
+        user_id=user_id,
+        episode_body=episode_body,
+        reference_time=reference_time,
+    )
     results = await graphiti.add_episode(
         name=f"chat-{reference_time.isoformat()}",
         episode_body=episode_body,
@@ -292,15 +312,52 @@ async def ingest_turn(
         source_description="chat turn",
         reference_time=reference_time,
         group_id=user_id,
+        uuid=episode_uuid,
         entity_types=ENTITY_TYPES,
         edge_types=EDGE_TYPES,
         edge_type_map=EDGE_TYPE_MAP,
         custom_extraction_instructions=CUSTOM_EXTRACTION_INSTRUCTIONS,
+        # [] not None: None makes Graphiti look up recent episodes by time, which
+        # would return the episode we just pre-saved as its own "previous" context.
         previous_episode_uuids=(
-            [previous_episode_uuid] if previous_episode_uuid else None
+            [previous_episode_uuid] if previous_episode_uuid else []
         ),
     )
     return results.episode.uuid, _reflections_from_edges(results.edges)
+
+
+async def _ensure_episode(
+    graphiti: Graphiti,
+    *,
+    episode_uuid: str,
+    user_id: str,
+    episode_body: str,
+    reference_time: datetime,
+) -> None:
+    """Create the episode node once; never overwrite it.
+
+    In graphiti-core 0.29.2, `add_episode(uuid=...)` *loads* an existing episode and
+    fails if it is absent, so the node must exist first. Create-only (not upsert),
+    matching Graphiti's own concurrent-ingestion design: overwriting on retry would
+    reset the `entity_edges` an earlier attempt already linked.
+    """
+    try:
+        await EpisodicNode.get_by_uuid(graphiti.driver, episode_uuid)
+        return
+    except NodeNotFoundError:
+        pass
+    episode = EpisodicNode(
+        uuid=episode_uuid,
+        name=f"chat-{reference_time.isoformat()}",
+        group_id=user_id,
+        labels=[],
+        source=EpisodeType.message,
+        source_description="chat turn",
+        content=episode_body,
+        created_at=datetime.now(tz=UTC),
+        valid_at=reference_time,
+    )
+    await episode.save(graphiti.driver)
 
 
 def _reflections_from_edges(edges: list[EntityEdge]) -> list[str]:
@@ -322,20 +379,36 @@ async def search_memory(
     user_id: str,
     query: str,
     durable_only: bool = True,
+    current_only: bool = True,
     num_results: int = 8,
 ) -> list[str]:
     """Return relevant fact strings for the user, scoped to their graph.
 
     durable_only=True filters OUT transient Feels/EnergyLevel edges, so volatile
     mood/energy is never surfaced as a stable belief.
+
+    current_only=True filters OUT facts Graphiti has invalidated or superseded.
+    Invalidation alone only marks the old edge; search still returns it unless
+    filtered, so "what's my focus?" would get the stale answer next to the new one.
     """
-    search_filter = (
-        SearchFilters(edge_types=DURABLE_EDGE_TYPES) if durable_only else None
-    )
+    filters: dict = {}
+    if durable_only:
+        filters["edge_types"] = DURABLE_EDGE_TYPES
+    if current_only:
+        now = datetime.now(tz=UTC)
+        # Still true in the world (no end, or an end in the future) AND not
+        # superseded in the graph. Outer list = OR, inner list = AND.
+        filters["invalid_at"] = [
+            [DateFilter(comparison_operator=ComparisonOperator.is_null)],
+            [DateFilter(date=now, comparison_operator=ComparisonOperator.greater_than)],
+        ]
+        filters["expired_at"] = [
+            [DateFilter(comparison_operator=ComparisonOperator.is_null)]
+        ]
     edges = await graphiti.search(
         query=query,
         group_ids=[user_id],
         num_results=num_results,
-        search_filter=search_filter,
+        search_filter=SearchFilters(**filters) if filters else None,
     )
     return [edge.fact for edge in edges]

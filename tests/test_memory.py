@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import os
 import types
+import uuid as uuid_mod
+from datetime import UTC, datetime
+from typing import Any
 
 # restate_service builds an Agent + Tavily tool at import — give it dummy creds.
 os.environ.setdefault("TAVILY_API_KEY", "dummy")
@@ -153,3 +156,175 @@ async def test_agent_surfaces_current_fact_not_stale(monkeypatch):
     out = result.output.lower()
     assert "job" in out
     assert "shelved" in out
+
+
+# --- Idempotent ingestion under Restate retries ----------------------------
+class FakeEpisodeStore:
+    """Mimics graphiti-core 0.29.2: `add_episode(uuid=X)` loads episode X and raises
+    NodeNotFoundError when it is absent; Graphiti never dedupes episode nodes."""
+
+    def __init__(self, fail_first_add_after_write: bool = False):
+        self.episodes: dict[str, Any] = {}
+        self.saves = 0
+        self.add_calls: list[dict] = []
+        self.fail_first_add_after_write = fail_first_add_after_write
+
+    def install(self, monkeypatch) -> None:
+        store = self
+
+        async def get_by_uuid(cls, driver, uuid):
+            if uuid not in store.episodes:
+                raise memory.NodeNotFoundError(uuid)
+            return store.episodes[uuid]
+
+        async def save(node, driver):
+            store.saves += 1
+            store.episodes[node.uuid] = node
+
+        monkeypatch.setattr(
+            memory.EpisodicNode, "get_by_uuid", classmethod(get_by_uuid)
+        )
+        monkeypatch.setattr(memory.EpisodicNode, "save", save)
+
+    async def add_episode(self, **kwargs):
+        self.add_calls.append(kwargs)
+        episode = self.episodes[kwargs["uuid"]]  # KeyError ≈ NodeNotFoundError
+        episode.entity_edges = ["edge-1"]  # the write an interrupted attempt leaves
+        if self.fail_first_add_after_write and len(self.add_calls) == 1:
+            raise ConnectionError("crash after the graph write, before journaling")
+        return types.SimpleNamespace(episode=episode, edges=[])
+
+
+def fake_graphiti(store: FakeEpisodeStore):
+    return types.SimpleNamespace(driver=object(), add_episode=store.add_episode)
+
+
+async def _ingest(graphiti, previous: str | None = None):
+    return await memory.ingest_turn(
+        graphiti,
+        user_id="test-user",
+        episode_uuid="ep-1",
+        episode_body="Alex: I started a new job.\nAssistant: Congrats!",
+        reference_time=datetime(2026, 11, 17, tzinfo=UTC),
+        previous_episode_uuid=previous,
+    )
+
+
+async def test_ingest_turn_retry_reuses_one_episode(monkeypatch):
+    store = FakeEpisodeStore()
+    store.install(monkeypatch)
+    graphiti = fake_graphiti(store)
+
+    await _ingest(graphiti)
+    await _ingest(graphiti)  # the retry
+
+    assert list(store.episodes) == ["ep-1"]
+    assert store.saves == 1  # create-only: the retry never overwrites
+    assert store.episodes["ep-1"].entity_edges == ["edge-1"]
+    assert all(call["uuid"] == "ep-1" for call in store.add_calls)
+
+
+async def test_first_ingest_never_lets_graphiti_look_up_previous_episodes(
+    monkeypatch,
+):
+    # None would make Graphiti fetch recent episodes by time — including the one
+    # just pre-saved — as this episode's own context.
+    store = FakeEpisodeStore()
+    store.install(monkeypatch)
+
+    await _ingest(fake_graphiti(store), previous=None)
+    await _ingest(fake_graphiti(store), previous="ep-0")
+
+    assert store.add_calls[0]["previous_episode_uuids"] == []
+    assert store.add_calls[1]["previous_episode_uuids"] == ["ep-0"]
+
+
+class FakeContext:
+    """Just enough of a Restate context to drive the handlers in-process."""
+
+    def __init__(self, key: str = "test-user", now: float = 1_763_337_600.0):
+        self._key, self._now = key, now
+        self.state: dict = {}
+        self.sent: list[dict] = []
+
+    def key(self) -> str:
+        return self._key
+
+    def uuid(self):
+        return uuid_mod.UUID(int=42)  # deterministic, as Restate's is per invocation
+
+    async def time(self) -> float:
+        return self._now
+
+    async def get(self, name, type_hint=None):
+        return self.state.get(name)
+
+    def set(self, name, value) -> None:
+        self.state[name] = value
+
+    async def run_typed(self, name, fn):
+        return await fn()
+
+    async def object_call(self, handler, key, arg):
+        return []
+
+    def object_send(self, handler, key, arg) -> None:
+        self.sent.append(arg)
+
+
+async def test_ingest_handler_passes_a_stable_episode_uuid(monkeypatch):
+    store = FakeEpisodeStore()
+    store.install(monkeypatch)
+
+    async def get_graphiti():
+        return fake_graphiti(store)
+
+    monkeypatch.setattr(rs, "get_graphiti", get_graphiti)
+    payload = {
+        "episode_body": "Alex: I started a new job.",
+        "reference_time": "2026-11-17T00:00:00+00:00",
+    }
+    ctx: Any = FakeContext()
+    result = await rs.ingest(ctx, payload)
+
+    assert result["episode_uuid"] == str(uuid_mod.UUID(int=42))
+    assert store.add_calls[0]["uuid"] == result["episode_uuid"]
+
+
+async def test_chat_run_uses_the_durable_clock_for_ingestion(monkeypatch):
+    async def get_graphiti():
+        return object()
+
+    async def agent_run(prompt, **kwargs):
+        return types.SimpleNamespace(output="Congrats!", new_messages=lambda: [])
+
+    monkeypatch.setattr(rs, "get_graphiti", get_graphiti)
+    monkeypatch.setattr(rs.restate_agent, "run", agent_run)
+    ctx: Any = FakeContext(now=1_763_337_600.0)
+
+    out = await rs.run(ctx, {"prompt": "I started a new job this week."})
+
+    expected = datetime.fromtimestamp(1_763_337_600.0, tz=UTC).isoformat()
+    assert ctx.sent[0]["reference_time"] == expected  # replay-safe send argument
+    assert out["timestamp"] == expected
+
+
+# --- Retrieval returns only what is true now -------------------------------
+async def test_search_memory_excludes_invalidated_and_superseded_facts():
+    captured: dict = {}
+
+    async def search(**kwargs):
+        captured.update(kwargs)
+        return []
+
+    graphiti: Any = types.SimpleNamespace(search=search)
+    await memory.search_memory(graphiti, user_id="test-user", query="my focus?")
+
+    f = captured["search_filter"]
+    assert f.edge_types == memory.DURABLE_EDGE_TYPES
+    ops = memory.ComparisonOperator
+    assert [[d.comparison_operator for d in g] for g in f.invalid_at] == [
+        [ops.is_null],
+        [ops.greater_than],
+    ]
+    assert [[d.comparison_operator for d in g] for g in f.expired_at] == [[ops.is_null]]

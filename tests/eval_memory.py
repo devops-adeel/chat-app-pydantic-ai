@@ -21,6 +21,7 @@ import asyncio
 import os
 import sys
 import time
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import memory
@@ -106,6 +107,7 @@ async def scenario_temporal(graphiti, group_id: str) -> str:
         previous_uuid, reflections = await memory.ingest_turn(
             graphiti,
             user_id=group_id,
+            episode_uuid=str(uuid.uuid4()),
             episode_body=f"{EVAL_USER}: {body}",
             reference_time=reference_time,
             previous_episode_uuid=previous_uuid,
@@ -118,8 +120,22 @@ async def scenario_temporal(graphiti, group_id: str) -> str:
         graphiti, user_id=group_id, query=TEMPORAL_QUERY, durable_only=True
     )
     _print_facts(f"Durable facts for {TEMPORAL_QUERY!r}:", facts)
+
+    # Ask the graph which facts it has itself marked as no longer true; none of
+    # them may come back as a current fact. (A text check like "job" in results
+    # passed while the stale "focus is the thesis" fact was returned alongside.)
+    result = await graphiti.driver.execute_query(
+        "MATCH (:Entity)-[e:RELATES_TO]->(:Entity) WHERE e.group_id = $gid "
+        "AND (e.invalid_at IS NOT NULL OR e.expired_at IS NOT NULL) "
+        "RETURN e.fact AS fact",
+        gid=group_id,
+    )
+    invalidated = {rec["fact"] for rec in result.records}
+    stale = [fact for fact in facts if fact in invalidated]
+    _print_facts("Invalidated facts in the graph:", sorted(invalidated))
+    _print_facts("Stale facts returned as current:", stale)
     joined = " ".join(facts).lower()
-    return "PASS" if "job" in joined else "FAIL"
+    return "PASS" if "job" in joined and invalidated and not stale else "FAIL"
 
 
 async def scenario_transient(graphiti, group_id: str) -> str:
@@ -139,6 +155,7 @@ async def scenario_transient(graphiti, group_id: str) -> str:
     await memory.ingest_turn(
         graphiti,
         user_id=group_id,
+        episode_uuid=str(uuid.uuid4()),
         episode_body=f"{EVAL_USER}: {body}",
         reference_time=reference_time,
     )
@@ -166,6 +183,49 @@ async def scenario_transient(graphiti, group_id: str) -> str:
     return "INCONCLUSIVE"  # mood not classified transient — extraction-quality signal
 
 
+async def _count_episodes(graphiti, group_id: str) -> int:
+    result = await graphiti.driver.execute_query(
+        "MATCH (e:Episodic) WHERE e.group_id = $gid RETURN count(e) AS n",
+        gid=group_id,
+    )
+    return result.records[0]["n"]
+
+
+async def scenario_retry(graphiti, group_id: str) -> str:
+    """Crash-retry idempotency: the same turn ingested twice under one episode uuid.
+
+    This is what a Restate retry does after a crash between the graph write and the
+    journal record (ctx.uuid() is stable across retries). PASS = one episode node.
+    Fact-edge counts are printed, not asserted: facts are re-extracted by the LLM and
+    converge via Graphiti's dedup, which is best-effort.
+    """
+    print("\n=== Scenario 3: crash-retry idempotency (same episode uuid twice) ===")
+    reference_time, body = TEMPORAL_EPISODES[1]
+    episode_uuid = str(uuid.uuid4())
+    edge_counts = []
+    for attempt in (1, 2):
+        await memory.ingest_turn(
+            graphiti,
+            user_id=group_id,
+            episode_uuid=episode_uuid,
+            episode_body=f"{EVAL_USER}: {body}",
+            reference_time=reference_time,
+        )
+        edge_counts.append(len(await _fetch_edges(graphiti, group_id)))
+        mentions = await graphiti.driver.execute_query(
+            "MATCH (:Episodic {uuid: $uuid})-[m:MENTIONS]->() RETURN count(m) AS n",
+            uuid=episode_uuid,
+        )
+        print(
+            f"attempt {attempt}: fact edges in graph = {edge_counts[-1]}, "
+            f"episode MENTIONS links = {mentions.records[0]['n']}"
+        )
+
+    episodes = await _count_episodes(graphiti, group_id)
+    print(f"episode nodes after retry = {episodes}")
+    return "PASS" if episodes == 1 else "FAIL"
+
+
 async def main() -> int:
     if not _have_keys():
         print(
@@ -181,6 +241,7 @@ async def main() -> int:
     scenarios = {
         "temporal": scenario_temporal,
         "transient": scenario_transient,
+        "retry": scenario_retry,
     }
     results: dict[str, str] = {}
     try:

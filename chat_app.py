@@ -83,14 +83,16 @@ async def lifespan(_app: fastapi.FastAPI):
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
                 f"{RESTATE_ADMIN}/deployments",
-                json={"uri": SERVICE_ENDPOINT},
+                # uvicorn serves HTTP/1.1 only; Restate defaults to HTTP/2.
+                json={"uri": SERVICE_ENDPOINT, "use_http_11": True},
             )
             resp.raise_for_status()
             print(f"[restate] registered deployment: {SERVICE_ENDPOINT}")
     except Exception as exc:
         # Non-fatal — register manually if needed:
         # curl -X POST localhost:9070/deployments -H 'Content-Type: application/json' \
-        #      -d '{"uri": "http://host.docker.internal:8000/restate-service"}'
+        #      -d '{"uri": "http://host.docker.internal:8000/restate-service",
+        #           "use_http_11": true}'
         print(f"[restate] registration skipped (start Restate first): {exc}")
 
     # Warm the Graphiti/Neo4j client once: build indices + open the connection pool
