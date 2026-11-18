@@ -307,3 +307,24 @@ async def test_chat_run_uses_the_durable_clock_for_ingestion(monkeypatch):
     expected = datetime.fromtimestamp(1_763_337_600.0, tz=UTC).isoformat()
     assert ctx.sent[0]["reference_time"] == expected  # replay-safe send argument
     assert out["timestamp"] == expected
+
+
+# --- Retrieval returns only what is true now -------------------------------
+async def test_search_memory_excludes_invalidated_and_superseded_facts():
+    captured: dict = {}
+
+    async def search(**kwargs):
+        captured.update(kwargs)
+        return []
+
+    graphiti: Any = types.SimpleNamespace(search=search)
+    await memory.search_memory(graphiti, user_id="test-user", query="my focus?")
+
+    f = captured["search_filter"]
+    assert f.edge_types == memory.DURABLE_EDGE_TYPES
+    ops = memory.ComparisonOperator
+    assert [[d.comparison_operator for d in g] for g in f.invalid_at] == [
+        [ops.is_null],
+        [ops.greater_than],
+    ]
+    assert [[d.comparison_operator for d in g] for g in f.expired_at] == [[ops.is_null]]

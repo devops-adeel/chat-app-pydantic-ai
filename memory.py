@@ -41,7 +41,11 @@ from graphiti_core.errors import NodeNotFoundError
 from graphiti_core.llm_client.anthropic_client import AnthropicClient
 from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
-from graphiti_core.search.search_filters import SearchFilters
+from graphiti_core.search.search_filters import (
+    ComparisonOperator,
+    DateFilter,
+    SearchFilters,
+)
 from pydantic import BaseModel, Field
 
 # Quiet Neo4j's "property key does not exist" notifications. Graphiti's queries
@@ -287,8 +291,9 @@ async def ingest_turn(
     Idempotent per `episode_uuid`: a retry after a crash mid-ingest reuses the same
     episode node instead of minting a duplicate (Graphiti never dedupes episodes).
     Entities/facts are re-extracted on retry and converge via Graphiti's own dedup —
-    best-effort, not exactly-once — and a fact invalidated by the interrupted attempt
-    is not re-reported, so that reflection can be lost.
+    best-effort, not exactly-once. Two residues of an interrupted attempt remain: a
+    fact it invalidated is not re-reported (that reflection can be lost), and its
+    episode→entity MENTIONS links are re-created (Graphiti mints them fresh uuids).
 
     Returns (episode_uuid, reflection_notes) where reflection_notes describe facts
     this turn invalidated — the proactive-nudge surface.
@@ -374,20 +379,36 @@ async def search_memory(
     user_id: str,
     query: str,
     durable_only: bool = True,
+    current_only: bool = True,
     num_results: int = 8,
 ) -> list[str]:
     """Return relevant fact strings for the user, scoped to their graph.
 
     durable_only=True filters OUT transient Feels/EnergyLevel edges, so volatile
     mood/energy is never surfaced as a stable belief.
+
+    current_only=True filters OUT facts Graphiti has invalidated or superseded.
+    Invalidation alone only marks the old edge; search still returns it unless
+    filtered, so "what's my focus?" would get the stale answer next to the new one.
     """
-    search_filter = (
-        SearchFilters(edge_types=DURABLE_EDGE_TYPES) if durable_only else None
-    )
+    filters: dict = {}
+    if durable_only:
+        filters["edge_types"] = DURABLE_EDGE_TYPES
+    if current_only:
+        now = datetime.now(tz=UTC)
+        # Still true in the world (no end, or an end in the future) AND not
+        # superseded in the graph. Outer list = OR, inner list = AND.
+        filters["invalid_at"] = [
+            [DateFilter(comparison_operator=ComparisonOperator.is_null)],
+            [DateFilter(date=now, comparison_operator=ComparisonOperator.greater_than)],
+        ]
+        filters["expired_at"] = [
+            [DateFilter(comparison_operator=ComparisonOperator.is_null)]
+        ]
     edges = await graphiti.search(
         query=query,
         group_ids=[user_id],
         num_results=num_results,
-        search_filter=search_filter,
+        search_filter=SearchFilters(**filters) if filters else None,
     )
     return [edge.fact for edge in edges]

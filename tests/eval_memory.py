@@ -120,8 +120,22 @@ async def scenario_temporal(graphiti, group_id: str) -> str:
         graphiti, user_id=group_id, query=TEMPORAL_QUERY, durable_only=True
     )
     _print_facts(f"Durable facts for {TEMPORAL_QUERY!r}:", facts)
+
+    # Ask the graph which facts it has itself marked as no longer true; none of
+    # them may come back as a current fact. (A text check like "job" in results
+    # passed while the stale "focus is the thesis" fact was returned alongside.)
+    result = await graphiti.driver.execute_query(
+        "MATCH (:Entity)-[e:RELATES_TO]->(:Entity) WHERE e.group_id = $gid "
+        "AND (e.invalid_at IS NOT NULL OR e.expired_at IS NOT NULL) "
+        "RETURN e.fact AS fact",
+        gid=group_id,
+    )
+    invalidated = {rec["fact"] for rec in result.records}
+    stale = [fact for fact in facts if fact in invalidated]
+    _print_facts("Invalidated facts in the graph:", sorted(invalidated))
+    _print_facts("Stale facts returned as current:", stale)
     joined = " ".join(facts).lower()
-    return "PASS" if "job" in joined else "FAIL"
+    return "PASS" if "job" in joined and invalidated and not stale else "FAIL"
 
 
 async def scenario_transient(graphiti, group_id: str) -> str:
@@ -198,7 +212,14 @@ async def scenario_retry(graphiti, group_id: str) -> str:
             reference_time=reference_time,
         )
         edge_counts.append(len(await _fetch_edges(graphiti, group_id)))
-        print(f"attempt {attempt}: fact edges in graph = {edge_counts[-1]}")
+        mentions = await graphiti.driver.execute_query(
+            "MATCH (:Episodic {uuid: $uuid})-[m:MENTIONS]->() RETURN count(m) AS n",
+            uuid=episode_uuid,
+        )
+        print(
+            f"attempt {attempt}: fact edges in graph = {edge_counts[-1]}, "
+            f"episode MENTIONS links = {mentions.records[0]['n']}"
+        )
 
     episodes = await _count_episodes(graphiti, group_id)
     print(f"episode nodes after retry = {episodes}")
